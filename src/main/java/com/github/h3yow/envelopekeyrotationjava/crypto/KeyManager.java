@@ -2,6 +2,7 @@ package com.github.h3yow.envelopekeyrotationjava.crypto;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.nio.ByteBuffer;
@@ -13,6 +14,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntPredicate;
 
 /**
  * 进程内信封加密密钥管理器：模拟密钥生命周期（创建、轮换、停用、销毁）。
@@ -28,11 +30,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>信封结构：每条消息生成随机 DEK，用版本对应的 KEK 以 AES-GCM 包裹；
  * payload 布局 = wrapIv(12B) | wrappedDek(48B) | dataIv(12B) | dataCiphertext+tag。
  * 两段 GCM 的 AAD 均绑定版本号，篡改版本字段会导致认证失败。</p>
+ *
+ * <p>版本保留上限：保留版本（未销毁）数量达到 {@code maxVersions} 时，轮换请求以
+ * {@link FailureReason#VERSION_LIMIT_EXCEEDED} 被明确拒绝——不会悄悄丢弃最老版本。
+ * 销毁边界：版本仍被存量密文引用时，销毁请求以 {@link FailureReason#KEY_STILL_REFERENCED}
+ * 被拒绝，该原因与其他失败明确可区分。</p>
  */
 @Service
 public class KeyManager {
 
     private static final Logger log = LoggerFactory.getLogger(KeyManager.class);
+
+    /** 默认保留版本上限。 */
+    static final int DEFAULT_MAX_VERSIONS = 10;
 
     private static final int WRAP_IV_OFF = 0;
     private static final int WRAPPED_DEK_OFF = WRAP_IV_OFF + AesGcmCipher.IV_BYTES;
@@ -43,18 +53,39 @@ public class KeyManager {
 
     private final ConcurrentHashMap<Integer, KeyVersion> versions = new ConcurrentHashMap<>();
     private final Object rotationLock = new Object();
+    private volatile int maxVersions;
 
     private volatile KeyVersion active;
     private volatile long rotationEpoch;
 
+    /**
+     * 引用检查器：入参为版本号，返回该版本是否仍被存量密文引用。
+     * 默认不引用任何版本；由迁移/存储层在装配时注册。
+     */
+    private volatile IntPredicate referenceChecker = version -> false;
+
     /** 测试钩子：在轮换临界区内、新版本创建前执行。仅用于并发测试，生产环境不得设置。 */
     private volatile Runnable rotationHook;
 
+    /** 便捷构造器：使用 {@link #DEFAULT_MAX_VERSIONS} 作为保留上限。 */
     public KeyManager() {
+        this(DEFAULT_MAX_VERSIONS);
+    }
+
+    /**
+     * 主构造器：Spring 注入 {@code crypto.max-versions}（缺省 10）；
+     * 单元测试也可直接传入显式上限。
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    public KeyManager(@Value("${crypto.max-versions:" + DEFAULT_MAX_VERSIONS + "}") int maxVersions) {
+        if (maxVersions < 1) {
+            throw new IllegalArgumentException("maxVersions must be at least 1");
+        }
+        this.maxVersions = maxVersions;
         KeyVersion initial = new KeyVersion(1, AesGcmCipher.generateKey(), Instant.now());
         versions.put(1, initial);
         active = initial;
-        log.info("key manager initialized, activeVersion={}", 1);
+        log.info("key manager initialized, activeVersion={}, maxVersions={}", 1, maxVersions);
     }
 
     /** 使用当前活跃版本加密，返回携带版本信息的密文。 */
@@ -147,6 +178,14 @@ public class KeyManager {
                 log.info("rotate converged: another rotation completed concurrently, activeVersion={}", converged);
                 return converged;
             }
+            int retained = retainedVersionCount();
+            if (retained >= maxVersions) {
+                log.warn("rotate rejected: retainedVersions={}, maxVersions={}, reason={}",
+                        retained, maxVersions, FailureReason.VERSION_LIMIT_EXCEEDED);
+                throw new KeyOperationException(FailureReason.VERSION_LIMIT_EXCEEDED,
+                        "retained version count " + retained + " reached limit " + maxVersions
+                                + "; migrate data off old versions and destroy them before rotating");
+            }
             Runnable hook = rotationHook;
             if (hook != null) {
                 hook.run();
@@ -175,9 +214,21 @@ public class KeyManager {
                 active != null && active.getStatus() == KeyStatus.ACTIVE);
     }
 
-    /** 销毁指定版本（DISABLED -&gt; DESTROYED），密钥材料清零，不可逆。 */
+    /**
+     * 销毁指定版本（DISABLED -&gt; DESTROYED），密钥材料清零，不可逆。
+     *
+     * <p>边界：只要仍有任何存量密文引用该版本（无论其当前处于何种状态），
+     * 一律以 {@link FailureReason#KEY_STILL_REFERENCED} 拒绝，且该检查先于状态迁移执行，
+     * 不会留下半销毁状态。</p>
+     */
     public void destroy(int version) {
         KeyVersion key = requireVersion(version);
+        if (referenceChecker.test(version)) {
+            log.warn("destroy rejected: keyVersion={} still referenced, reason={}",
+                    version, FailureReason.KEY_STILL_REFERENCED);
+            throw new KeyOperationException(FailureReason.KEY_STILL_REFERENCED, version,
+                    "key version " + version + " is still referenced by stored ciphertext and cannot be destroyed");
+        }
         key.transitionTo(KeyStatus.DESTROYED);
         key.destroyMaterial();
         log.info("destroy ok: keyVersion={}, material cleared", version);
@@ -196,6 +247,59 @@ public class KeyManager {
         List<KeyVersion> snapshot = new ArrayList<>(versions.values());
         snapshot.sort(Comparator.comparingInt(KeyVersion::getVersion));
         return snapshot;
+    }
+
+    /** 当前保留版本（未销毁）数量。销毁后的版本不再计入保留上限。 */
+    public int retainedVersionCount() {
+        return (int) versions.values().stream()
+                .filter(kv -> kv.getStatus() != KeyStatus.DESTROYED)
+                .count();
+    }
+
+    /** 保留版本上限。 */
+    public int maxVersions() {
+        return maxVersions;
+    }
+
+    /**
+     * 下调保留版本上限（运维收紧容量）。
+     *
+     * <p>允许把上限调到小于当前保留数：已存在的版本不会被静默删除，但系统进入"超限"状态——
+     * 之后的轮换被拒绝（守卫条件 retained &ge; maxVersions 在超限时同样成立），
+     * 迁移在 retained &gt; maxVersions 时也被明确拒绝，必须先下线（停用+销毁）
+     * 无引用的旧版本，使保留数回落到新上限以内。</p>
+     */
+    public void reconfigureMaxVersions(int newLimit) {
+        if (newLimit < 1) {
+            throw new IllegalArgumentException("maxVersions must be at least 1");
+        }
+        synchronized (rotationLock) {
+            int old = this.maxVersions;
+            this.maxVersions = newLimit;
+            log.info("maxVersions reconfigured: {} -> {}, retainedVersions={}",
+                    old, newLimit, retainedVersionCount());
+        }
+    }
+
+    /**
+     * 迁移前置校验：迁移本身不新增版本，但当保留版本数已<b>超过</b>上限
+     * （例如上限被下调）时明确拒绝，避免在超限状态下继续堆积；
+     * 恰好等于上限时迁移仍允许执行——迁移是把数据搬离旧版本、使其可销毁的唯一出路。
+     */
+    public void checkMigrationCapacity() {
+        int retained = retainedVersionCount();
+        if (retained > maxVersions) {
+            log.warn("migration rejected: retainedVersions={}, maxVersions={}, reason={}",
+                    retained, maxVersions, FailureReason.VERSION_LIMIT_EXCEEDED);
+            throw new KeyOperationException(FailureReason.VERSION_LIMIT_EXCEEDED,
+                    "retained version count " + retained + " exceeds limit " + maxVersions
+                            + "; destroy unreferenced old versions first");
+        }
+    }
+
+    /** 注册"版本是否仍被密文引用"的检查器（由存储/迁移层在装配时调用）。 */
+    public void setReferenceChecker(IntPredicate checker) {
+        this.referenceChecker = checker == null ? version -> false : checker;
     }
 
     /** 仅测试使用：设置轮换钩子。 */

@@ -27,7 +27,8 @@ public class CryptoExceptionHandler {
         HttpStatus status = switch (reason) {
             case VERSION_MISSING, CIPHERTEXT_MALFORMED -> HttpStatus.BAD_REQUEST;
             case CIPHERTEXT_TAMPERED, KEY_DISABLED, KEY_DESTROYED,
-                 ILLEGAL_STATE_TRANSITION, NO_ACTIVE_KEY -> HttpStatus.CONFLICT;
+                 ILLEGAL_STATE_TRANSITION, NO_ACTIVE_KEY,
+                 KEY_STILL_REFERENCED, VERSION_LIMIT_EXCEEDED -> HttpStatus.CONFLICT;
             case KEY_NOT_FOUND -> HttpStatus.NOT_FOUND;
         };
         Map<String, Object> body = new LinkedHashMap<>();

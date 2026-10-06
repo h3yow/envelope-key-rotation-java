@@ -72,7 +72,8 @@ class KeyManagerTest {
 
     @Test
     void burstRotationKeepsStateConsistent() throws Exception {
-        KeyManager km = new KeyManager();
+        // 本用例需要 16 次连续轮换，显式放宽保留上限，避免与版本容量上限语义耦合
+        KeyManager km = new KeyManager(32);
         int initial = km.activeVersion().orElseThrow();
         int threads = 16;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

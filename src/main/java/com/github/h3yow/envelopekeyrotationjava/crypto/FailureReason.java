@@ -19,5 +19,9 @@ public enum FailureReason {
     /** 当前没有可用于加密的活跃密钥版本。 */
     NO_ACTIVE_KEY,
     /** 生命周期状态迁移非法或操作不被允许。 */
-    ILLEGAL_STATE_TRANSITION
+    ILLEGAL_STATE_TRANSITION,
+    /** 版本仍被存量密文引用，拒绝销毁。 */
+    KEY_STILL_REFERENCED,
+    /** 保留版本数已达上限，拒绝产生新版本的请求。 */
+    VERSION_LIMIT_EXCEEDED
 }
