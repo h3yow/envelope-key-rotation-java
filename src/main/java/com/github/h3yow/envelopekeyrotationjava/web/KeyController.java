@@ -2,6 +2,8 @@ package com.github.h3yow.envelopekeyrotationjava.web;
 
 import com.github.h3yow.envelopekeyrotationjava.crypto.Ciphertext;
 import com.github.h3yow.envelopekeyrotationjava.crypto.KeyManager;
+import com.github.h3yow.envelopekeyrotationjava.crypto.MigrationReport;
+import com.github.h3yow.envelopekeyrotationjava.crypto.MigrationService;
 import org.springframework.web.bind.annotation.*;
 
 import java.nio.charset.StandardCharsets;
@@ -16,9 +18,11 @@ import java.util.Map;
 public class KeyController {
 
     private final KeyManager keyManager;
+    private final MigrationService migrationService;
 
-    public KeyController(KeyManager keyManager) {
+    public KeyController(KeyManager keyManager, MigrationService migrationService) {
         this.keyManager = keyManager;
+        this.migrationService = migrationService;
     }
 
     public record EncryptRequest(String plaintext) {}
@@ -44,6 +48,11 @@ public class KeyController {
     @PostMapping("/rotate")
     public RotateResponse rotate() {
         return new RotateResponse(keyManager.rotate());
+    }
+
+    @PostMapping("/migrate")
+    public MigrationReport migrate() {
+        return migrationService.migrateAll();
     }
 
     @PostMapping("/{version}/deactivate")

@@ -6,7 +6,7 @@
 ## 构建与验证
 
 ```bash
-mvn test          # 运行全部 19 个测试（含并发轮换、历史兼容、篡改、生命周期）
+mvn test          # 运行全部 27 个测试（含并发轮换、批量迁移、历史兼容、篡改、生命周期、版本边界）
 mvn spring-boot:run
 ```
 
@@ -56,6 +56,48 @@ ACTIVE --(deactivate)--> DISABLED
   需轮换出新版本方可恢复加密。
 - **销毁**：仅允许从 DISABLED 迁移，密钥材料清零，不可逆。
   ACTIVE 直接销毁等非法迁移以 `ILLEGAL_STATE_TRANSITION` 拒绝。
+  若已配置密文存储且其中仍有密文引用该版本，销毁以 `KEY_IN_USE` 拒绝
+  （引用检查优先于状态迁移检查，原因可与其他失败明确区分）——
+  即一个版本只有在确认没有任何密文引用后才允许销毁。
+
+## 批量迁移（旧数据重加密到最新版本）
+
+`MigrationService` 把密文存储中的旧版本密文统一重加密到当前活跃版本，
+迁移前后解出的明文完全一致。典型用法：
+
+```java
+MigrationReport report = migrationService.migrateAll();        // 全量
+MigrationReport partial = migrationService.migrateBatch(ids);  // 指定一批
+// report: total / migrated / alreadyCurrent / failed / failures(含可区分原因)
+```
+
+REST：`POST /api/keys/migrate` 迁移存储中的全部记录，返回同上报告。
+
+语义约定：
+
+- **幂等**：已在当前活跃版本的记录原样跳过（计入 `alreadyCurrent`），
+  同一批数据重复执行第二遍、第三遍不产生重复结果（`migrated=0`），
+  密文字节完全不变，已迁移数据不会被破坏。
+- **可续跑**：逐条处理、逐条经 CAS 写回即生效。中途中断后重新执行同一批请求即可
+  从断点继续——已处理部分被识别为 `alreadyCurrent`，不会被重新处理，也不会回退
+  （迁移只写入当前活跃版本，绝不写回旧版本）。
+- **并发收敛**：写回采用 compare-and-set，仅当存储值仍等于迁移前读到的值才生效；
+  多个迁移者同时处理同一批数据时，每条记录恰好被一个迁移者重加密，
+  其余迁移者重读后识别为已完成，最终收敛为同一结果，不会出现两套并行的迁移方向。
+- **不停服**：迁移期间读写照常。未迁移的记录按旧版本解密、已迁移的按新版本解密，
+  任意时刻读出的明文一致；新写入直接使用当前活跃版本。
+- **单条失败不阻断**：解密失败等原因计入 `failures`（含记录 id 与 `FailureReason`），
+  其余记录继续处理。
+
+## 版本保留上限与销毁边界
+
+- **保留上限**：`KeyManager` 构造时可指定 `maxVersions`（默认 64）。
+  版本数达到上限后，新的**轮换**与**迁移**请求都以 `VERSION_LIMIT_EXCEEDED`
+  明确拒绝——绝不悄悄淘汰最老版本或让版本凭空消失；拒绝不影响已有密文的解密。
+- **销毁边界**：`destroy` 前检查密文存储，只要还有密文引用该版本即以
+  `KEY_IN_USE` 拒绝（且不清除密钥材料）；确认零引用后才允许销毁。
+  推荐下线顺序：`rotate` → `migrate`（确认无引用）→ `deactivate` → `destroy`。
+  注意：版本停用（DISABLED）后其密文即不可解密，迁移必须在停用前完成。
 
 ## 错误分类
 
@@ -72,6 +114,8 @@ ACTIVE --(deactivate)--> DISABLED
 | KEY_DESTROYED | 409 | 密钥已销毁 |
 | NO_ACTIVE_KEY | 409 | 无可用活跃版本（活跃键被停用） |
 | ILLEGAL_STATE_TRANSITION | 409 | 非法生命周期迁移 |
+| KEY_IN_USE | 409 | 版本仍被密文引用，拒绝销毁 |
+| VERSION_LIMIT_EXCEEDED | 507 | 保留版本数达上限，拒绝轮换/迁移 |
 
 ## REST API
 
@@ -80,9 +124,13 @@ ACTIVE --(deactivate)--> DISABLED
 | POST | `/api/keys/encrypt` | `{"plaintext": "..."}` → `{"ciphertext", "keyVersion"}` |
 | POST | `/api/keys/decrypt` | `{"ciphertext": "..."}` → `{"plaintext", "keyVersion"}` |
 | POST | `/api/keys/rotate` | 轮换 → `{"activeVersion"}` |
+| POST | `/api/keys/migrate` | 批量迁移全部记录到当前版本 → `{"total","migrated","alreadyCurrent","failed","failures"}` |
 | POST | `/api/keys/{version}/deactivate` | 停用指定版本 |
-| POST | `/api/keys/{version}/destroy` | 销毁指定版本（须先停用） |
+| POST | `/api/keys/{version}/destroy` | 销毁指定版本（须先停用且无引用） |
 | GET | `/api/keys` | 列出版本与状态（不含密钥材料） |
+| PUT | `/api/records/{id}` | `{"plaintext": "..."}` 加密写入一条业务记录（模拟在线写流量） |
+| GET | `/api/records/{id}` | 读取并解密一条记录（迁移前后明文一致） |
+| GET | `/api/records` | 列出记录 id 与密文版本（不暴露密文） |
 
 ## 测试与验证方法
 
@@ -96,6 +144,26 @@ ACTIVE --(deactivate)--> DISABLED
 | `KeyManagerTest.disabledKeyRejectsEncryptAndDecrypt` / `destroyIsIrreversibleAndClearsMaterial` | 停用/销毁语义、不可逆性、材料清零 |
 | `KeyManagerTest.keyMaterialNeverLeaksIntoExceptionOrToString` | 密钥材料不泄露 |
 | `KeyControllerTest` | HTTP 层错误分类与响应脱敏 |
+| `MigrationServiceTest.batchMigrationReencryptsToLatestAndPlaintextIdentical` | 批量迁移到最新版本，迁移前后明文一致 |
+| `MigrationServiceTest.migrationIsIdempotentAcrossRepeatedRuns` | 幂等：重复执行不产生重复结果，密文稳定不变 |
+| `MigrationServiceTest.interruptedMigrationResumesWithoutReprocessing` | 中断续跑：已处理部分不重处理、不回退 |
+| `MigrationServiceTest.concurrentMigratorsConvergeToSameResult` | 多迁移者并发收敛：每条记录恰好迁移一次 |
+| `MigrationServiceTest.migrationDuringConcurrentReadWriteIsConsistent` | 迁移与在线读写并存时结论一致 |
+| `MigrationServiceTest.destroyRejectedWhileVersionStillReferenced` | 版本被引用时销毁以 `KEY_IN_USE` 拒绝，迁移完成后才允许销毁 |
+| `MigrationServiceTest.versionLimitRejectsRotationAndMigration` | 版本数达上限时轮换与迁移均以 `VERSION_LIMIT_EXCEEDED` 拒绝，无静默淘汰 |
+| `MigrationServiceTest.reencryptOnCurrentVersionCiphertextIsPassThrough` | 当前版本密文重加密为 no-op |
 
 单测日志会打印密钥版本与判定依据（`assertion basis: expectedReason=..., actualReason=..., keyVersion=...`），
-可用 `mvn test | grep "assertion basis"` 观察。
+可用 `mvn test | grep "assertion basis"` 观察；迁移场景用例打印 `scenario=<场景名>: ... PASS`，
+可用 `mvn test | grep "scenario="` 查看每个迁移场景的用例与结果。
+
+本地手动验证迁移（无需外部服务）：
+
+```bash
+mvn spring-boot:run &
+curl -X PUT localhost:8080/api/records/a -H 'Content-Type: application/json' -d '{"plaintext":"old-data"}'
+curl -X POST localhost:8080/api/keys/rotate     # 轮换出新版本
+curl -X POST localhost:8080/api/keys/migrate    # {"total":1,"migrated":1,"alreadyCurrent":0,...}
+curl -X POST localhost:8080/api/keys/migrate    # 幂等：{"migrated":0,"alreadyCurrent":1,...}
+curl localhost:8080/api/records/a               # 明文仍为 old-data
+```
